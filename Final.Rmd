@@ -1,0 +1,325 @@
+---
+title: "Final Project_topic model"
+author: "Yufei Liu"
+date: "2024-05-23"
+output: pdf_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+library(dplyr)
+library(ggplot2)
+library(tidyr)
+library(stringr)
+library(corrplot)
+library(lubridate)
+library(Matrix)  # For sparse matrices
+library(gamlr)  # For regression models
+library(parallel)  # For parallel computing
+library(ggplot2)  # For plotting
+library(knitr)
+library(textir)
+library(maptpx)
+library(slam)
+library(wordcloud)
+library(gamlr)
+library(tm)
+library(dplyr)
+library(tidyr)
+library(stringr)
+library(ggplot2)
+library(lubridate)
+library(caret)
+library(glmnet)
+library(rpart)
+library(rpart.plot)
+library(randomForest)
+```
+
+# Topic Model
+
+```{r}
+setwd("~/GitHub/bigdata_g12/FinalProject")
+setwd("~/Documents/Document/U.S/class/spring2024/Big Data/Final_project")
+```
+
+```{r}
+game <- read.csv("game2.csv")
+```
+
+```{r}
+str(game)
+
+reviews <- game$Reviews
+
+# 处理多字节字符串问题
+reviews <- iconv(reviews, to = "ASCII//TRANSLIT")
+
+# 转换为小写
+reviews <- tolower(reviews)
+
+# 移除非字母字符
+reviews <- gsub("[^a-z ]", "", reviews)
+
+# 分词
+reviews <- strsplit(reviews, "\\s+")
+
+# 创建词频矩阵，过滤停用词
+corpus <- Corpus(VectorSource(reviews))
+corpus <- tm_map(corpus, removeWords, stopwords("en"))
+dtm <- DocumentTermMatrix(corpus)
+dtm_matrix <- as.matrix(dtm)
+
+# 标准化词频矩阵
+dtm_matrix <- dtm_matrix / rowSums(dtm_matrix)
+dtm_matrix <- scale(dtm_matrix)
+
+# 移除包含NA/NaN/Inf的行
+complete_rows <- complete.cases(dtm_matrix) & is.finite(game$Rating)
+dtm_matrix <- dtm_matrix[complete_rows, ]
+game <- game[complete_rows, ]
+
+# K-means聚类
+set.seed(123)
+kmeans_result <- kmeans(dtm_matrix, centers = 4)
+
+# 打印每个聚类的前20个词
+apply(kmeans_result$centers, 1, function(cluster_center) {
+  colnames(dtm_matrix)[order(-cluster_center)[1:20]]
+})
+
+# 主题建模分析
+dtm_simple_triplet <- as.simple_triplet_matrix(dtm)
+dtm_simple_triplet <- dtm_simple_triplet[complete_rows, ]
+topics_result <- topics(dtm_simple_triplet, K = 10)
+
+# 打印每个主题的前10个词
+summary(topics_result, n = 10)
+
+```
+
+```{r}
+stars <- game$Rating
+tpcreg <- gamlr(topics_result$omega, stars)
+
+coef(tpcreg) * 0.1
+
+regtopics_cv <- cv.gamlr(topics_result$omega, stars, lambda.min.ratio = 10^-4)
+x <- 100 * dtm_matrix / rowSums(dtm_matrix)
+regwords_cv <- cv.gamlr(x, stars)
+
+par(mfrow = c(1, 2))
+plot(regtopics_cv)
+mtext("topic regression", font = 2, line = 2)
+plot(regwords_cv)
+mtext("bigram regression", font = 2, line = 2)
+
+# 输出最小OOS MSE
+min(regtopics_cv$cvm)
+min(regwords_cv$cvm)
+```
+
+```{r}
+par(mfrow = c(1, 2))
+wordcloud(rownames(topics_result$theta), freq = topics_result$theta[, 1], min.freq = 0.004, col = "maroon")
+wordcloud(rownames(topics_result$theta), freq = topics_result$theta[, 2], min.freq = 0.004, col = "navy")
+```
+
+```{r}
+genre_rating_summary <- game %>%
+  group_by(genre) %>%
+  summarise(
+    average_rating = mean(Rating, na.rm = TRUE),
+    max_rating = max(Rating, na.rm = TRUE),
+    count = n()
+  )
+
+# 查看结果
+print(genre_rating_summary)
+```
+
+```{r}
+# top_100_score <- game %>%
+#   arrange(desc(Rating)) %>%
+#   slice(1:100) %>%
+#   select(Title, publisher,activePlayers,Rating,genre,Release.Date)
+# 
+# top_100_attract <- game %>%
+#   arrange(desc(activePlayers)) %>%
+#   slice(1:100) %>%
+#   select(Title, publisher,activePlayers,Rating,genre,Release.Date)
+```
+
+```{r}
+
+```
+
+```{r}
+game$series <- sapply(str_split(game$Title, "\\s+"), function(words) {
+  paste(words[1:min(length(words), 2)], collapse = " ")
+})
+
+# 计算每个系列的出现次数
+series_counts <- game %>%
+  group_by(series, publisher) %>%
+  summarise(Count = n(), .groups = 'drop')
+
+# 将 series_counts 加入到原数据框中
+game <- game %>%
+  left_join(series_counts, by = c("series", "publisher"))
+
+# 标记大IP和小IP
+game <- game %>%
+  mutate(IP_Type = case_when(
+    Count >= 6 ~ "Big IP",
+    Count >= 4 ~ "Medium IP",
+    Count >= 2 ~ "Small IP",
+    TRUE ~ "Not IP"
+  ))
+
+
+```
+
+```{r}
+print(game)
+
+```
+
+```{r}
+game <- game %>%
+  mutate(activePlayersGroup = cut(activePlayers, breaks = c(-Inf, 120000, 170000, Inf), labels = c("Low", "Medium", "High")))
+
+ip_data <- game %>%
+  filter(IP_Type %in% c("Big IP", "Small IP","Medium IP"))
+
+ip_data$activePlayers <- as.numeric(ip_data$activePlayers)
+table(ip_data$IP_Type)
+```
+
+```{r}
+ip_genre_table <- table(ip_data$IP_Type, ip_data$genre)
+
+```
+
+```{r}
+ip_data$activePlayers <- as.numeric(ip_data$activePlayers)
+
+summary(ip_data$activePlayers)
+
+ip_avg_active_players <- ip_data %>%
+  group_by(IP_Type) %>%
+  summarise(
+    avg_activePlayers = mean(activePlayers, na.rm = TRUE),
+    max_activePlayers = max(activePlayers, na.rm = TRUE),
+    min_activePlayers = min(activePlayers, na.rm = TRUE),
+    count = n()
+  )
+
+# 查看结果
+print(ip_avg_active_players)
+```
+
+```{r}
+library(tidyverse)
+library(rpart)
+library(rpart.plot)
+
+tree_model <- rpart(IP_Type ~ activePlayers + genre, data = ip_data, method = "class")
+
+summary(tree_model)
+
+rpart.plot(tree_model, type = 3, extra = 101, fallen.leaves = TRUE, main = "Decision Tree for IP Type by Active Players and Genre",
+           cex = 0.4, # 调整字体大小
+           tweak = 1.2, # 调整图形元素大小
+           box.palette = "RdBu", shadow.col = "gray", nn = TRUE)
+```
+
+```{r}
+library(glmnet)
+library(caret)
+game <- game %>%
+  filter(!is.na(Rating) & !is.na(genre) & !is.na(IP_Type))
+game$IP_Type <- factor(game$IP_Type, levels = c("Big IP", "Medium IP", "Small IP", "Not IP"))
+
+# 构建 Lasso 模型
+lasso_model <- gamlr(x, y, family = "binomial", standardize = TRUE, lambda.min.ratio = 1e-3)
+
+# 绘制模型
+plot(lasso_model)
+
+# in-sample R2
+in_sample_r2 <- 1 - lasso_model$deviance[which.min(AICc(lasso_model))] / lasso_model$deviance[1]
+print(in_sample_r2)
+
+# 提取最佳模型的系数
+lasso_coef <- coef(lasso_model, select = which.min(AICc(lasso_model)))
+
+# 转换系数为数据框
+lasso_coef_df <- as.data.frame(as.matrix(lasso_coef))
+colnames(lasso_coef_df) <- c("Coefficient")
+lasso_coef_df$Feature <- rownames(lasso_coef_df)
+rownames(lasso_coef_df) <- NULL
+
+# 筛选显著的系数
+lasso_coef_sig <- lasso_coef_df %>%
+  filter(Coefficient != 0) %>%
+  arrange(desc(Coefficient))
+
+# 查看显著的系数
+print(lasso_coef_sig)
+```
+
+```{r}
+chisq_test <- chisq.test(ip_genre_table)
+
+print(chisq_test)
+```
+
+```{r}
+library(MatchIt)
+genre <- as.factor(game$genre)
+
+levels(genre)
+game$treatment <- ifelse(genre%in% c("Action", "Action-Adventure", "Adventure"), 1, 0)
+
+# 倾向评分匹配
+matchit_model <- matchit(treatment ~ Wishlist + Rating+ Number.of.Reviews, data = game, method = "nearest", caliper = 0.01)
+
+# 获取匹配后的数据
+matched_data <- match.data(matchit_model)
+causal_model <- lm(activePlayers ~ treatment, data = matched_data)
+
+# 查看模型摘要
+summary(causal_model)
+```
+
+-   Times.Listed
+
+```{r}
+plot(matchit_model, type = "jitter")
+plot(matchit_model, type = "qq")
+```
+
+```{r}
+library(tidyverse)
+library(hdm)
+game$IP_Type <- factor(game$IP_Type, levels = c("Big IP", "Medium IP", "Small IP", "Not IP"))
+
+# 确保所有变量都没有缺失值
+game <- game %>%
+  drop_na(Rating, genre, IP_Type)
+# 创建虚拟变量矩阵
+x <- model.matrix(~ Rating + genre, data = game)[, -1]
+
+# 设置响应变量
+y <- as.numeric(game$IP_Type == "Big IP"|game$IP_Type == "Medium IP"|game$IP_Type == "Small IP")  # 这里以 "Big IP" 作为主要的研究对象，二元响应变量
+
+d <- game$Rating
+# 创建工具变量矩阵
+z <- model.matrix(~ Times.Listed + activePlayers + Number.of.Reviews + Count, data = game)[, -1]
+
+lasso_iv_model <- rlassoIV(x = x, d = d, y = y, z = z, method = "double selection")
+
+summary(lasso_iv_model)
+
+```

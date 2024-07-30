@@ -1,0 +1,170 @@
+---
+title: "Untitled"
+author: "Yufei Liu"
+date: "2024-05-26"
+output: pdf_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+knitr::opts_chunk$set(echo = TRUE)
+library(tidyverse)
+library(rpart)
+library(rpart.plot)
+library(caret)
+library(stringr)
+library(dplyr)
+library(ggplot2)
+library(tidyr)
+library(stringr)
+library(corrplot)
+library(lubridate)
+library(Matrix)  # For sparse matrices
+library(gamlr)  # For regression models
+library(parallel)  # For parallel computing
+library(ggplot2)  # For plotting
+library(knitr)
+library(textir)
+library(maptpx)
+library(slam)
+library(wordcloud)
+library(gamlr)
+library(tm)
+library(dplyr)
+library(tidyr)
+library(stringr)
+library(ggplot2)
+library(lubridate)
+library(caret)
+library(glmnet)
+library(rpart)
+library(rpart.plot)
+library(randomForest)
+```
+
+```{r}
+setwd("~/Documents/Document/U.S/class/spring2024/Big Data/Final_project")
+game <- read.csv("game2.csv")
+
+game$log_activePlayers <- log(game$activePlayers + 1)
+game$series <- sapply(str_split(game$Title, "\\s+"), function(words) {
+  paste(words[1:min(length(words), 2)], collapse = " ")
+})
+
+series_counts <- game %>%
+  group_by(series, publisher) %>%
+  summarise(Count = n(), .groups = 'drop')
+
+game <- game %>%
+  left_join(series_counts, by = c("series", "publisher"))
+
+game <- game %>%
+  mutate(IP_Type = case_when(
+    Count >= 6 ~ "Big IP",
+    Count >= 4 ~ "Medium IP",
+    Count >= 2 ~ "Small IP",
+    TRUE ~ "Not IP"
+  ))
+
+game <- game %>%
+  filter(!is.na(activePlayers) & !is.na(genre) & !is.na(IP_Type))
+
+game$IP_Type <- factor(game$IP_Type, levels = c("Big IP", "Medium IP", "Small IP", "Not IP"))
+
+game <- game %>%
+  drop_na(activePlayers, genre, IP_Type)
+
+game$genre <- factor(game$genre)  
+levels_genre <- levels(game$genre)
+
+set.seed(123)
+trainIndex <- createDataPartition(game$IP_Type, p = .8, 
+                                  list = FALSE, 
+                                  times = 1)
+gameTrain <- game[ trainIndex,]
+gameTest  <- game[-trainIndex,]
+
+gameTrain$genre <- factor(gameTrain$genre, levels = levels_genre)
+gameTest$genre <- factor(gameTest$genre, levels = levels_genre)
+
+gameTrain_balanced <- upSample(x = gameTrain[, c("activePlayers", "genre")], y = gameTrain$IP_Type)
+
+tree_model <- rpart(Class ~ activePlayers + genre, data = gameTrain_balanced, method = "class")
+
+summary(tree_model)
+
+
+rpart.plot(tree_model, type = 3, extra = 101, fallen.leaves = TRUE, 
+           main = "Decision Tree for IP Type by Active Players and Genre",
+           cex = 0.4, 
+           tweak = 1.2,
+           box.palette = "RdBu", shadow.col = "gray", nn = TRUE)
+
+
+train_pred <- predict(tree_model, newdata = gameTrain, type = "class")
+
+# Test set prediction
+test_pred <- predict(tree_model, newdata = gameTest, type = "class")
+
+# Calculating training set accuracy
+train_accuracy <- mean(train_pred == gameTrain$IP_Type)
+test_accuracy <- mean(test_pred == gameTest$IP_Type)
+
+# Output results
+print(paste("Training set accuracy:", train_accuracy))
+print(paste("Test set accuracy:", test_accuracy))
+
+# Calculating training set and test set R²
+train_R2 <- caret::postResample(as.numeric(train_pred), as.numeric(gameTrain$IP_Type))["Rsquared"]
+test_R2 <- caret::postResample(as.numeric(test_pred), as.numeric(gameTest$IP_Type))["Rsquared"]
+
+# Output results
+print(paste("Training set R²:", train_R2))
+print(paste("Test set R²:", test_R2))
+
+library(tree)
+game_tree <- tree(log_activePlayers ~ Rating + genre, data=gameTrain)
+rpart.plot(tree_model, type = 3, extra = 101, fallen.leaves = TRUE, 
+           main = "Decision Tree for Log Active Players by Rating and Genre",
+           cex = 0.4, 
+           tweak = 1.2,
+           box.palette = "RdBu", shadow.col = "gray", nn = TRUE)
+
+
+```
+
+```{r}
+par(mfrow=c(2,2))
+rating_grid <- expand.grid(Rating = seq(min(game$Rating), max(game$Rating), length = 1000), 
+                           genre = levels_genre) 
+
+for (g in levels_genre) {
+  genre_grid <- rating_grid %>% filter(genre == g)
+  train_data <- gameTrain %>% filter(genre == g)
+  
+  if (nrow(train_data) > 0) {
+    plot(train_data$Rating, train_data$log_activePlayers, 
+         pch=21, bg=8, xlab="Rating", ylab="Log Active Players", main=paste("Genre:", g))
+    lines(genre_grid$Rating, predict(game_tree, newdata=genre_grid), col=2, lwd=3)
+  }
+}
+
+
+rf_game <- randomForest(log_activePlayers ~ Rating + genre, data=gameTrain, nodesize=10)
+
+for (g in levels_genre) {
+  genre_grid <- rating_grid %>% filter(genre == g)
+  train_data <- gameTrain %>% filter(genre == g)
+  
+  if (nrow(train_data) > 0) {
+    pred_rf_game <- predict(rf_game, genre_grid)
+    plot(train_data$Rating, train_data$log_activePlayers, 
+         pch=21, bg=8, xlab="Rating", ylab="Log Active Players", main=paste("Genre:", g))
+    lines(genre_grid$Rating, pred_rf_game, col=2, lwd=2)
+  }
+}
+
+
+plot(rf_game)
+```
+

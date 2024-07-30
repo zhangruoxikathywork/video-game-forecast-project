@@ -1,0 +1,1467 @@
+---
+title: "DataProcessing"
+author: 'G12: Yufei Liu, Kathy Zhang, Liujun Hua'
+date: "2024-05-26"
+output: word_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+library(dplyr)
+library(ggplot2)
+library(tidyr)
+library(stringr)
+library(corrplot)
+library(lubridate)
+library(Matrix)  # For sparse matrices
+library(gamlr)  # For regression models
+library(parallel)  # For parallel computing
+library(ggplot2)  # For plotting
+library(knitr)
+library(textir)
+library(maptpx)
+library(slam)
+library(wordcloud)
+library(gamlr)
+library(tm)
+library(dplyr)
+library(tidyr)
+library(stringr)
+library(ggplot2)
+library(lubridate)
+library(caret)
+library(glmnet)
+library(rpart)
+library(rpart.plot)
+library(randomForest)
+```
+
+
+## Data Cleaning and Variable Creation 
+```{r}
+setwd("~/GitHub/bigdata_g12/FinalProject")
+
+## Data Cleaning and Variable Creation
+
+# Load the datasets
+popular_vg <- read.csv("popular_vg_1980-2023.csv", stringsAsFactors = FALSE)
+vgchartz_2024 <- read.csv("vgchartz-2024.csv", stringsAsFactors = FALSE)
+names(vgchartz_2024)[names(vgchartz_2024) == "title"] <- "Title"
+
+popular_vg$Release.Date <- as.Date(popular_vg$Release.Date, format="%Y-%m-%d")
+popular_vg$year <- year(popular_vg$Release.Date)
+popular_vg <- popular_vg[order(popular_vg$year), ]
+
+# Clean two datasets
+popular_vg <- popular_vg %>%
+  group_by(Title) %>%
+  summarise(
+    Release.Date = first(Release.Date),
+    year = first(year),
+    Team = first(Team),
+    Rating = first(Rating),
+    Times.Listed = first(Times.Listed),
+    Number.of.Reviews = first(Number.of.Reviews),
+    Genres = first(Genres),
+    Summary = first(Summary),
+    Reviews = paste(unique(Reviews), collapse = " "),
+    Plays = first(Plays),
+    Playing = first(Playing),
+    Backlogs = first(Backlogs),
+    Wishlist = first(Wishlist),
+    .groups = 'drop'
+  )
+
+vgchartz_2024 <- vgchartz_2024 %>%
+  group_by(Title) %>%
+  summarise(
+    console = paste(unique(console), collapse = " "),
+    publisher = first(publisher),
+    developer = first(developer),
+    genre = first(genre),
+    total_sales = sum(total_sales),  # Corrected typo here
+    .groups = 'drop'
+  )
+
+# Perform the inner join
+game <- inner_join(vgchartz_2024[, c("Title", "console", "publisher", "developer", "genre", "total_sales")], popular_vg[, c("Title","Release.Date", "Genres", "Rating", "Times.Listed", "year", "Number.of.Reviews", "Summary", "Reviews", "Plays", "Playing", "Backlogs", "Wishlist")], by = "Title")
+game <- game %>% distinct()
+
+# Convert 'Plays' and 'Number.of.Reviews' from K format to numeric
+game$Plays <- as.numeric(str_replace(game$Plays, "K", "")) * 1000
+game$Playing <- as.numeric(str_replace(game$Playing, "K", "")) * 1000
+game$Backlogs <- as.numeric(str_replace(game$Backlogs, "K", "")) * 1000
+game$Wishlist <- as.numeric(str_replace(game$Wishlist, "K", "")) * 1000
+game$Number.of.Reviews <- as.numeric(str_replace(game$Number.of.Reviews, "K", "")) * 1000
+
+# Keep only post 2005 data
+game <- game %>% filter(year >= 2005)
+
+# Remove rows with NAs only in the specified columns
+columns_to_clean <- c("Rating", "Summary", "Reviews", "year")
+game <- game %>%
+  filter(!if_any(all_of(columns_to_clean), is.na))
+
+# Create additional vars
+game <- game %>%
+  mutate(atvi_indi = ifelse(publisher %in% c("Activision", "Blizzard Entertainment") | developer == "Blizzard Entertainment", 1, 0))
+game$activePlayers <- game$Plays + game$Playing
+game$allPlayers <- game$Plays + game$Playing + game$Backlogs  
+game$year_adj <- game$year - 2000
+game$log_activePlayers <- log(game$activePlayers+1)
+game$log_allPlayers <- log(game$allPlayers+1)
+game <- game %>% 
+  mutate(activePlayers_dummy = ifelse(allPlayers > median(game$activePlayers), 1, 0))
+
+summary(game)
+
+write.csv(game, "game.csv", row.names = FALSE)
+```
+
+```{r}
+game <- read.csv("game.csv", fill = TRUE)
+```
+
+## Clean Summary
+```{r}
+## Clean Summary words
+# Define filler words to be removed
+filler_words <- c("the", "is", "a", "has", "have", "and", "of", "in", "to", "for", "with", "on", "that", "lets","as", "out", "by","from", "this", "be", "an", "v", "or", "so", "you", "are", "can", "will", "which", "t", "who", "where", "also", "his", "her", "their", "they", "up", "he", "she", "its", "it", "includes", "include","your", "you", "all","���������", "s", "any", "ll", "was", "but", "if", "there", "these")
+
+# Function to clean and tokenize text, removing filler words
+clean_and_tokenize <- function(text, filler_words) {
+  text_clean <- tolower(enc2utf8(text))
+  # text_clean <- tolower(gsub("[^\\x01-\\x7F]", "", text_clean))
+  text_clean <- str_replace_all(text_clean, "[[:punct:]]", " ")
+  words <- unlist(strsplit(text_clean, "\\s+"))
+  words <- words[!words %in% filler_words]
+  return(words)
+}
+
+# Apply the function to the Summary column
+game$Summary_clean <- sapply(game$Summary, function(x) paste(clean_and_tokenize(x, filler_words), collapse = " "))
+
+# Create a corpus from the cleaned summaries
+corpus <- Corpus(VectorSource(game$Summary_clean))
+tdm <- TermDocumentMatrix(corpus, control = list(wordLengths = c(1, Inf)))
+tdm_matrix <- as.matrix(tdm)
+
+
+# Get word frequencies
+word_freq <- sort(rowSums(tdm_matrix), decreasing = TRUE)
+word_freq_df <- data.frame(word = names(word_freq), frequency = word_freq)
+
+# Filter for significant words
+sig_word_sum <- word_freq_df %>% filter(frequency > 5)
+sig_word_sum <- sig_word_sum %>% arrange(word) %>% slice(-1:-19)
+sig_word_sum <- as.character(sig_word_sum$word)
+
+# Convert to sparse matrix
+tdm_filtered <- tdm_matrix[sig_word_sum, ]
+tdm_sparse <- as(t(tdm_filtered), "sparseMatrix")
+
+
+# Filter the term-document matrix to keep only significant words
+tdm_filtered <- tdm_matrix[sig_word_sum, ]
+tdm_sparse <- as(t(tdm_filtered), "sparseMatrix")
+```
+
+```{r}
+## Yufei's IP
+game$series <- sapply(str_split(game$Title, "\\s+"), function(words) {
+  paste(words[1:min(length(words), 2)], collapse = " ")
+})
+
+# 计算每个系列的出现次数
+series_counts <- game %>%
+  group_by(series, publisher) %>%
+  summarise(Count = n(), .groups = 'drop')
+
+# 将 series_counts 加入到原数据框中
+game <- game %>%
+  left_join(series_counts, by = c("series", "publisher"))
+
+# 标记大IP和小IP
+game <- game %>%
+  mutate(IP_Type = case_when(
+    Count >= 6 ~ "Big IP",
+    Count >= 4 ~ "Medium IP",
+    Count >= 2 ~ "Small IP",
+    TRUE ~ "Not IP"
+  ))
+
+game <- game %>%
+  mutate(activePlayersGroup = cut(activePlayers, breaks = c(-Inf, 120000, 170000, Inf), labels = c("Low", "Medium", "High")))
+
+ip_data <- game %>%
+  filter(IP_Type %in% c("Big IP", "Small IP","Medium IP"))
+
+ip_data$activePlayers <- as.numeric(ip_data$activePlayers)
+table(ip_data$IP_Type)
+
+ip_data$activePlayers <- as.numeric(ip_data$activePlayers)
+
+summary(ip_data$activePlayers)
+
+ip_avg_active_players <- ip_data %>%
+  group_by(IP_Type) %>%
+  summarise(
+    avg_activePlayers = mean(activePlayers, na.rm = TRUE),
+    max_activePlayers = max(activePlayers, na.rm = TRUE),
+    min_activePlayers = min(activePlayers, na.rm = TRUE),
+    count = n()
+  )
+
+library(glmnet)
+library(caret)
+game <- game %>%
+  filter(!is.na(Rating) & !is.na(genre) & !is.na(IP_Type))
+game$IP_Type <- factor(game$IP_Type, levels = c("Big IP", "Medium IP", "Small IP", "Not IP"))
+```
+
+```{r}
+## Processing Console
+
+consoles_list <- strsplit(game$console, split = " ")
+unique_consoles <- unique(unlist(consoles_list))
+console_matrix <- matrix(0, nrow = nrow(game), ncol = length(unique_consoles), dimnames = list(NULL, unique_consoles))
+for (i in seq_along(consoles_list)) {
+  console_matrix[i, consoles_list[[i]]] <- 1
+}
+console_sparse <- Matrix(console_matrix, sparse = TRUE)
+console_df <- as.data.frame(as.matrix(console_sparse))
+colnames(console_df) <- unique_consoles
+```
+
+```{r}
+## Combine x 
+
+set.seed(1234)
+
+genre_dummies <- model.matrix(~ genre - 1, data = game)
+year_cont <- model.matrix(~ year_adj, data = game)
+publisher_dummies <- model.matrix(~ publisher - 1, data = game)
+game$Rating <- as.numeric(game$Rating)
+rating_cont <- model.matrix(~ Rating, data = game)
+ip_dummies <- model.matrix(~ IP_Type - 1, data = game)
+x <- cbind(genre_dummies, year_cont, publisher_dummies, rating_cont, ip_dummies, tdm_sparse, console_sparse)
+x <- as(x, "sparseMatrix")
+
+# Make into a df for 3.B(2)(3) trees and forest
+x_tree <- cbind(game[, c("year_adj", "publisher", "genre", "IP_Type", "Rating")], console_df)
+
+y <- game$log_activePlayers
+```
+
+
+## Explore potential Y variables
+```{r}
+# Plot the distribution of total_sales and plays
+ggplot(game, aes(x = total_sales)) + 
+  geom_histogram(bins = 30, fill = "pink", color = "black") +
+  theme_minimal() +
+  labs(title = "Distribution of Total Sales (2005-2023)", x = "Total Sales", y = "Frequency") +
+  theme(plot.title = element_text(hjust = 0.5),
+        text = element_text(size = 12),
+        axis.title = element_text(size = 12, face = "bold"))
+
+ggplot(game, aes(x = total_sales)) + 
+  geom_histogram(bins = 30, fill = "pink", color = "black") +
+  theme_minimal() +
+  scale_x_log10() +
+  labs(title = "Distribution of Total Sales (Log Scale) (2005-2023)", x = "Total Sales (Log Scale)", y = "Frequency") +
+  theme(plot.title = element_text(hjust = 0.5),
+        text = element_text(size = 12),
+        axis.title = element_text(size = 12, face = "bold"))
+
+
+# Reshaping the data to long format
+game_long <- game %>%
+  # select(allPlayers, activePlayers) %>%  # Select the necessary columns
+  pivot_longer(
+    cols = c(allPlayers, activePlayers),
+    names_to = "PlayerType",
+    values_to = "Players"
+  ) 
+
+ggplot(game_long, aes(x = Players, fill = PlayerType)) +
+  geom_histogram(bins = 30, alpha = 0.6, position = "identity", color = "black") +
+  scale_fill_manual(values = c("orange", "purple")) +
+  labs(title = "Distribution of All Players vs. Active Players (2005-2023)",
+       x = "Number of Players",
+       y = "Frequency") +
+  theme_minimal() +
+  theme(plot.title = element_text(hjust = 0.5),
+        text = element_text(size = 12),
+        axis.title = element_text(size = 12, face = "bold"))
+
+
+ggplot(game_long, aes(x = Players, fill = PlayerType)) +
+  geom_histogram(bins = 30, alpha = 0.6, position = "identity", color = "black") +
+  scale_x_log10() + 
+  scale_fill_manual(values = c("orange", "purple")) +
+  labs(title = "Distribution of All Players vs. Active Players (Log Scale) (2005-2023)",
+       x = "Number of Players (Log Scale)",
+       y = "Frequency") +
+  theme_minimal() +
+  theme(plot.title = element_text(hjust = 0.5),
+        text = element_text(size = 12),
+        axis.title = element_text(size = 12, face = "bold"))
+```
+
+
+## EDA
+```{r}
+col_purple_orange <- colorRampPalette(c("orange","purple"))
+# Plot the correlation matrix with correlation coefficients
+numeric_vars <- game[, c("activePlayers", "allPlayers", "Number.of.Reviews", "Rating", "Backlogs", "Wishlist", "year")]
+cor_matrix <- cor(numeric_vars)
+corrplot(cor_matrix, method = "circle", col = col_purple_orange(200),
+         type = "upper", order = "hclust", tl.col = "black", tl.srt = 45,
+         addCoef.col = "black", cl.cex = 0.8, number.cex = 0.8)
+title("Correlation Matrix of Numeric Variables", line = 2.5, cex.main = 1.2)
+pairs(numeric_vars, col = "orange", main = "Pairs Plot of Numeric Variables")
+
+cor_matrix
+```
+
+```{r}
+library(ggplot2)
+library(dplyr)
+
+# Plot for all games
+p1 <- ggplot(game, aes(x = Rating, y = activePlayers)) +
+  geom_point(alpha = 0.4, color = "orange") +
+  geom_smooth(method = "lm", color = "red", fill = "orange", se = TRUE) +
+  labs(title = "Relationship between Game Rating and Number of Players for All Games",
+       x = "Game Rating", y = "Number of Active Players") +
+  theme_minimal() +
+  theme(plot.title = element_text(hjust = 0.5))
+p1
+
+# Plot for Activision Blizzard games
+p2 <- ggplot(game %>% filter(atvi_indi == 1), aes(x = Rating, y = activePlayers)) +
+  geom_point(alpha = 0.4, color = "purple") +
+  geom_smooth(method = "lm", color = "purple", fill = "purple", se = TRUE) +
+  labs(title = "Relationship between Game Rating and Number of Players for ATVI Games",
+       x = "Game Rating", y = "Number of Active Players") +
+  theme_minimal() +
+  theme(plot.title = element_text(hjust = 0.5))
+p2
+
+```
+
+```{r}
+# Plot histograms
+p1 <- ggplot(game, aes(x = Number.of.Reviews)) +
+  geom_histogram(fill = "purple", color = "black") +
+  theme_minimal() +
+  labs(title = "Histogram of Number of Reviews", x = "Number of Reviews", y = "Frequency") +
+  theme(plot.title = element_text(hjust = 0.5))
+
+p2 <- ggplot(game, aes(x = Rating)) +
+  geom_histogram(binwidth = 0.1, fill = "purple", color = "black") +
+  theme_minimal() +
+  labs(title = "Histogram of Ratings", x = "Rating", y = "Frequency") +
+  theme(plot.title = element_text(hjust = 0.5))
+
+p3 <- ggplot(game, aes(x = Wishlist)) +
+  geom_histogram(fill = "purple", color = "black") +
+  theme_minimal() +
+  labs(title = "Histogram of Wishlists", x = "Number of Wishlists", y = "Frequency") +
+  theme(plot.title = element_text(hjust = 0.5))
+
+# Plot average per year
+avg_reviews_per_year <- ggplot(game, aes(x = year, y = Number.of.Reviews)) +
+  stat_summary(fun = mean, geom = "bar", fill = "orange", color = "black") +
+  theme_minimal() +
+  labs(title = "Average Number of Reviews per Year", x = "Year", y = "Average Number of Reviews") +
+  theme(plot.title = element_text(hjust = 0.5))
+
+avg_rating_per_year <- ggplot(game, aes(x = year, y = Rating)) +
+  stat_summary(fun = mean, geom = "bar", fill = "orange", color = "black") +
+  theme_minimal() +
+  labs(title = "Average Rating per Year", x = "Year", y = "Average Rating") +
+  theme(plot.title = element_text(hjust = 0.5))
+
+avg_wishlists_per_year <- ggplot(game, aes(x = year, y = Wishlist)) +
+  stat_summary(fun = mean, geom = "bar", fill = "orange", color = "black") +
+  theme_minimal() +
+  labs(title = "Average Number of Wishlists per Year", x = "Year", y = "Average Number of Wishlists") +
+  theme(plot.title = element_text(hjust = 0.5))
+
+p1
+p2
+p3
+avg_reviews_per_year
+avg_rating_per_year
+avg_wishlists_per_year
+```
+
+```{r}
+# Plot relationship between total sales and players
+p <- ggplot() +
+  geom_point(data = game, aes(x = activePlayers, y = total_sales, color = "Active Players")) +
+  geom_smooth(data = game, aes(x = activePlayers, y = total_sales, color = "Active Players"), method = "lm", fill = "orange") +
+  geom_point(data = game, aes(x = allPlayers, y = total_sales, color = "All Players")) +
+  geom_smooth(data = game, aes(x = allPlayers, y = total_sales, color = "All Players"), method = "lm", fill = "pink") +
+  labs(title = "Total Sales vs Players (2005-2023)",
+       x = "Players",
+       y = "Total Sales",
+       color = "Player Type") +  # Label for the legend
+  theme_minimal() +
+  theme(plot.title = element_text(hjust = 0.5),
+        text = element_text(size = 12),
+        axis.title = element_text(size = 12, face = "bold")) +
+  scale_x_continuous(limits = c(0, 1000000)) +
+  scale_color_manual(values = c("Active Players" = "orange", "All Players" = "purple"))
+
+p
+```
+
+```{r}
+ggplot(game, aes(x = Rating)) + 
+  geom_histogram(bins = 30, fill = "pink", color = "black") +
+  theme_minimal() +
+  scale_x_log10() +
+  labs(title = "Distribution of Rating (2005-2023)", x = "Rating", y = "Frequency") +
+  theme(plot.title = element_text(hjust = 0.5),
+        text = element_text(size = 12),
+        axis.title = element_text(size = 12, face = "bold"))
+```
+
+```{r}
+# Games by Genre
+ggplot(game, aes(x = genre, fill = genre)) +
+  geom_bar(color = "black") +
+  labs(title = "Number of Games by Genre (2005-2023)",
+       x = "",  # Remove x-axis label
+       y = "Count") +
+  theme_minimal() +
+  theme(plot.title = element_text(hjust = 0.5),
+        text = element_text(size = 12),
+        axis.title = element_text(size = 12, face = "bold"),
+        legend.title = element_text(),
+        axis.text.x = element_blank(),
+        axis.ticks.x = element_blank(),
+        axis.title.x = element_blank())
+
+ggplot(game, aes(x = genre, y = allPlayers, fill = genre)) +
+  geom_boxplot() +
+  scale_y_log10() +  # Log scale for the y-axis to handle wide data range
+  labs(title = "Total Players by Genre (2005-2023)",
+       x = "Genre",
+       y = "Total Players") +
+  theme_minimal() +
+  theme(plot.title = element_text(hjust = 0.5),
+        text = element_text(size = 12),
+        axis.title = element_text(size = 12, face = "bold"),
+        legend.title = element_text(),
+        axis.text.x = element_blank())
+
+# Prepare the data: count games per year per genre
+game_year_genre <- game %>%
+  group_by(year, genre) %>%
+  summarise(count = n(), .groups = 'drop')  # ensure you have year and genre as factors or appropriate format
+
+# Plotting
+ggplot(game_year_genre, aes(x = year, y = count, color = genre, group = genre)) +
+  geom_line() +
+  labs(title = "Trend of Games (by Counts) by Genre Per Year", x = "Year", y = "Counts") +
+  theme_minimal() +
+  theme(plot.title = element_text(hjust = 0.5),
+        axis.text.x = element_text(angle = 45, hjust = 1),  # Rotate x-axis labels for better visibility
+        legend.title = element_blank())
+
+game_year_genre <- game %>%
+  group_by(year, genre) %>%
+  summarise(Average_Rating = mean(Rating, na.rm = TRUE), .groups = 'drop')  
+ggplot(game_year_genre, aes(x = year, y = Average_Rating, color = genre, group = genre)) +
+  geom_line() +
+  labs(title = "Trend of Games (by Rating) by Genre Per Year",
+       x = "Year",
+       y = "Average Rating") +
+  theme_minimal() +
+  theme(plot.title = element_text(hjust = 0.5),
+        axis.text.x = element_text(angle = 45, hjust = 1),
+        legend.title = element_blank())
+
+ggplot(game, aes(x = Release.Date, y = Rating, color = genre)) +  #Release.Date
+  geom_point(alpha = 0.5, size = 2) +
+  labs(title = "Game Ratings by Genre Over Years",
+       x = "Release.Date",
+       y = "Rating") +
+  theme_minimal() +
+  theme(plot.title = element_text(hjust = 0.5),
+        axis.title = element_text(face = "bold"),
+        legend.title = element_text(face = "bold")) +
+  guides(color = guide_legend(title = "Genre"))
+```
+
+
+```{r}
+# Distribution of games by console in the subset data
+game_long <- game %>%
+  tidyr::separate_rows(console, sep = " ") %>%
+  filter(!is.na(console)) # Ensure console is not NA
+
+console_counts <- game_long %>%
+  group_by(console) %>%
+  summarise(Count = n(),
+            Total_activePlayers = sum(as.numeric(activePlayers), na.rm = TRUE),
+            Total_Players = sum(as.numeric(allPlayers), na.rm = TRUE),
+            Average_Rating = mean(as.numeric(Rating), na.rm = TRUE)) %>%
+  ungroup()
+
+top_consoles <- console_counts %>%
+  top_n(10, Count) %>%
+  arrange(desc(Count))
+other <- console_counts %>%
+  filter(!console %in% top_consoles$console) %>%
+  summarise(console = "Other",
+            Count = sum(Count),
+            Total_activePlayers = sum(Total_activePlayers),
+            Total_Players = sum(Total_Players),
+            Average_Rating = mean(Average_Rating))
+final_console_data <- bind_rows(top_consoles, other)
+```
+
+
+```{r}
+# Pie chart
+pie_data <- final_console_data %>%
+  mutate(label = scales::percent(Count / sum(Count)))
+
+ggplot(pie_data, aes(x = "", y = Count, fill = console)) +
+  geom_col(color = "black") +
+  geom_text(aes(label = Count),
+            position = position_stack(vjust = 0.5)) +
+  labs(title = "Number of Games across Consoles (2005-2023)") +
+  theme_void() +
+  coord_polar(theta = "y") +
+  theme(plot.title = element_text(hjust = 0.5),
+        text = element_text(size = 12),
+        axis.title = element_text(size = 12, face = "bold"))
+```
+
+
+```{r}
+ggplot(final_console_data, aes(x = reorder(console, Total_Players, decreasing = TRUE), y = Total_Players, fill = console)) +
+  geom_bar(stat = "identity") +
+  labs(title = "Total Players per Console (2005-2023)", x = "Console", y = "Total Players") +
+  theme_minimal() +
+  theme(plot.title = element_text(hjust = 0.5),
+        axis.text.x = element_text(angle = 45, hjust = 1))
+
+game_long <- game %>%
+  separate_rows(console, sep = " ") %>%
+  mutate(allPlayers = as.numeric(allPlayers),
+         year = as.numeric(year)) %>%
+  filter(!is.na(console) & !is.na(allPlayers))
+
+# Summarize data by console and year, considering only top consoles and others
+yearly_console_data <- game_long %>%
+  group_by(year, console) %>%
+  summarise(Total_Players = sum(allPlayers, na.rm = TRUE), .groups = 'drop')
+
+# Incorporating top 10 consoles logic and "Other"
+top_consoles_list <- top_consoles$console  # Extract just the console names from the previous aggregation
+
+yearly_console_data <- yearly_console_data %>%
+  mutate(Grouped_Console = if_else(console %in% top_consoles_list, as.character(console), "Other")) %>%
+  group_by(year, Grouped_Console) %>%
+  summarise(Total_Players = sum(Total_Players), .groups = 'drop') %>%
+  ungroup()
+
+ggplot(yearly_console_data, aes(x = year, y = Total_Players, group = Grouped_Console, color = Grouped_Console)) +
+  geom_line() +
+  geom_point() +
+  labs(title = "Total Players per Console Over Years (2005-2023)",
+       x = "Year",
+       y = "Total Players",
+       color = "Console") +
+  theme_minimal() +
+  theme(plot.title = element_text(hjust = 0.5),
+        axis.text.x = element_text(angle = 45, hjust = 1),
+        legend.title = element_blank())
+
+
+ggplot(final_console_data, aes(x = reorder(console, Average_Rating, decreasing = TRUE), y = Average_Rating, fill = console)) +
+  geom_bar(stat = "identity") +
+  labs(title = "Average Rating per Console", x = "Console", y = "Average Rating") +
+  theme_minimal() +
+  theme(plot.title = element_text(hjust = 0.5),
+        axis.text.x = element_text(angle = 45, hjust = 1))
+```
+
+```{r}
+## Plot word cloud
+
+library(tm)
+library(wordcloud)
+library(dplyr)
+library(RColorBrewer)
+
+# Filter the term-document matrix to keep only significant words
+tdm_filtered <- tdm_matrix[sig_word_sum, ]
+
+# Create the word cloud
+word_freq_filtered <- sort(rowSums(tdm_filtered), decreasing = TRUE)
+wordcloud(names(word_freq_filtered), freq = word_freq_filtered, min.freq = 1, scale = c(4, 0.5), colors = brewer.pal(8, "Dark2"))
+```
+
+## FDR
+
+```{r}
+# Selecting columns and creating model matrix
+publisher_dummies <- model.matrix(~ publisher - 1, data = game)
+developer_dummies <- model.matrix(~ developer - 1, data = game)
+genre_dummies <- model.matrix(~ genre - 1, data = game)
+nReviews <- model.matrix(~ Number.of.Reviews, data = game)
+nRating <- model.matrix(~ Rating, data = game)
+wishlist_dummies <- model.matrix(~ Wishlist, data = game)
+year_cont <- model.matrix(~ year_adj, data = game)
+predictors_fdr <- cbind(year_cont, genre_dummies, publisher_dummies, wishlist_dummies, developer_dummies, nReviews, nRating)
+predictors_fdr <- as(predictors_fdr, "sparseMatrix")
+predictors_fdr <- as.data.frame(as.matrix(predictors_fdr))
+```
+
+
+```{r}
+# Load necessary library
+library(glmnet)
+library(gamlr)
+library(parallel)
+library(Matrix)
+source("fdr.R")
+
+
+# Split the console column by spaces (or your actual delimiter)
+consoles_list <- strsplit(game$console, split = " ")
+
+# Flatten the list into a single vector and get unique console types
+unique_consoles <- unique(unlist(consoles_list))
+
+# Create a matrix where each row corresponds to a game and each column to a console, filled initially with 0s
+console_matrix <- matrix(0, nrow = nrow(game), ncol = length(unique_consoles), dimnames = list(NULL, unique_consoles))
+for (i in seq_along(consoles_list)) {
+  console_matrix[i, consoles_list[[i]]] <- 1
+}
+console_sparse <- Matrix(console_matrix, sparse = TRUE)
+console_df <- as.data.frame(as.matrix(console_sparse))
+colnames(console_df) <- unique_consoles
+
+
+# Fit the linear model
+game_console <- cbind(game[, c("log_activePlayers", "year_adj", "Number.of.Reviews", "publisher", "genre", "Rating")], console_df)
+game_console$year_adj <- scale(game_console$year_adj)
+game_console$Rating <- scale(game_console$Rating)
+game_console$Number_of_Reviews <- scale(game_console$Number.of.Reviews)
+
+# game_console$Wishlist <- scale(game_console$Wishlist)
+
+fit <- lm(log_activePlayers ~ ., data=game_console)
+summary_fit <- summary(fit)
+coefficients <- summary_fit$coefficients
+mrgpvals <- coefficients[, 4]
+source("fdr.R")
+cutoff <- fdr_cut(mrgpvals,0.2,TRUE)
+significant_indices <- mrgpvals <= cutoff
+significant_coefficients <- coefficients[significant_indices, ]
+significant_predictors <- rownames(coefficients)[significant_indices]
+
+significant_predictors
+kable(table(mrgpvals<cutoff))
+cutoff
+```
+
+
+
+## LASSO
+
+```{r}
+# Selecting columns and creating model matrix
+game_console <- cbind(game[, c("year_adj", "Number.of.Reviews", "publisher", "genre", "Rating")], console_df)
+game_console$year_adj <- scale(game_console$year_adj)
+game_console$Number_of_Reviews <- scale(game_console$Number.of.Reviews)
+game_console$Rating <- as.numeric(game_console$Rating)
+
+# Convert to a model matrix for Lasso
+x <- model.matrix(~ ., data = game_console)
+```
+
+
+```{r}
+library(gamlr)
+lasso3.cv <- cv.gamlr(x, game$log_activePlayers, lambda.min.ratio = 1e-3,
+                      family = "gaussian", verb = TRUE)
+# par(mfrow=c(1,2))
+# plot(lasso3.cv$gamlr)
+# plot(lasso3.cv)
+sum(coef(lasso3.cv)!=0) # 1se
+sum(coef(lasso3.cv, s="min")!=0) # min
+sum(coef(lasso3.cv$gamlr)!=0) # AICc
+```
+
+```{r}
+set.seed(1234)
+# CROSS-VALIDATION
+coef(lasso3.cv) ## 1se rule; see ?cv.gamlr
+coef(lasso3.cv, select="min") ## min cv selection
+
+## log lambdas selected under various criteria
+log_lambdas <- function(cv_obj) {
+  gamlr_obj <- cv_obj$gamlr
+  n_lambdas <- length(gamlr_obj$lambda)
+  n <- nrow(cv_obj$gamlr$x)
+  
+  # Calculate AIC, AICc, and BIC
+  aic_values <- AIC(gamlr_obj)
+  aicc_values <- AICc(gamlr_obj)
+  bic_values <- BIC(gamlr_obj)
+  
+  # Extracting lambda values
+  lambda_aicc <- gamlr_obj$lambda[which.min(aicc_values)]
+  lambda_aic <- gamlr_obj$lambda[which.min(aic_values)]
+  lambda_bic <- gamlr_obj$lambda[which.min(bic_values)]
+  lambda_min <- cv_obj$lambda.min
+  lambda_1se <- cv_obj$lambda.1se
+  
+  return(list(lambda_aicc = lambda_aicc,
+              lambda_aic = lambda_aic,
+              lambda_bic = lambda_bic,
+              lambda_min = lambda_min,
+              lambda_1se = lambda_1se))
+}
+
+lambdas <- log_lambdas(lasso3.cv)
+
+# Log lambdas
+log(lambdas$lambda_aicc)
+log(lambdas$lambda_aic)
+log(lambdas$lambda_bic)
+log(lambdas$lambda_min)
+log(lambdas$lambda_1se)
+
+# Plot the cross-validation results with annotations
+# par(mfrow = c(1, 2))
+
+# Plot the LASSO path from gamlr
+plot(lasso3.cv$gamlr, main = "LASSO Path with AIC, AICc, BIC, and CV")
+
+# Adding vertical lines for the different criteria
+abline(v = log(lambdas$lambda_aicc), col = "black", lty = 2)
+abline(v = log(lambdas$lambda_aic), col = "purple", lty = 2)
+abline(v = log(lambdas$lambda_bic), col = "green", lty = 2)
+abline(v = log(lambdas$lambda_min), col = "orange", lty = 2)
+abline(v = log(lambdas$lambda_1se), col = "blue", lty = 2)
+
+legend("topright", bty = "n", lwd = 1, 
+       col = c("black", "purple", "green", "orange", "blue"),
+       legend = c("AICc", "AIC", "BIC", "CV.min", "CV.1se"))
+
+# Plot the cross-validation plot
+plot(lasso3.cv, main = "Cross-Validation")
+```
+
+```{r}
+y_pred <- predict(lasso3.cv, x, select = "min")
+rss <- sum((game$log_activePlayers - y_pred)^2)
+tss <- sum((game$log_activePlayers - mean(game$log_activePlayers))^2)
+R2<- 1 - rss/tss
+```
+
+
+## LASSO summary
+```{r}
+# Run lasso on genre, summary words, and year
+lasso_sum <- gamlr(x, game$log_activePlayers, standardize=TRUE, family = "gaussian", lambda.min.ratio=1e-3)
+plot(lasso_sum, main="LASSO plot, Summary Words+Other Controls")
+
+# in-sample R2
+1- lasso_sum$deviance[which.min(AICc(lasso_sum))]/lasso_sum$deviance[1]
+
+# Check coefficients
+lasso_sum_coef <- coef(lasso_sum, select=which.min(AICc(lasso_sum)))
+sum(lasso_sum_coef!=0)
+
+lasso_sum_coef <- as.data.frame(as.matrix(lasso_sum_coef))
+colnames(lasso_sum_coef) <- c("Coefficient")
+lasso_sum_coef$Feature <- rownames(lasso_sum_coef)
+rownames(lasso_sum_coef) <- NULL
+lasso_sum_coef_sig <- lasso_sum_coef %>% filter(Coefficient != 0)%>% arrange(desc(Coefficient))
+lasso_sum_coef_sig[-1, ]
+```
+
+```{r}
+library(gamlr)
+lasso_sum.cv <- cv.gamlr(x, game$log_activePlayers, lambda.min.ratio = 1e-3,
+                      family = "gaussian", verb = TRUE)
+sum(coef(lasso_sum.cv)!=0) # 1se
+sum(coef(lasso_sum.cv, s="min")!=0) # min
+sum(coef(lasso_sum.cv$gamlr)!=0) # AICc
+```
+
+```{r}
+set.seed(1234)
+# CROSS-VALIDATION
+coef(lasso_sum.cv) ## 1se rule; see ?cv.gamlr
+coef(lasso_sum.cv, select="min") ## min cv selection
+
+## log lambdas selected under various criteria
+log_lambdas <- function(cv_obj) {
+  gamlr_obj <- cv_obj$gamlr
+  n_lambdas <- length(gamlr_obj$lambda)
+  n <- nrow(cv_obj$gamlr$x)
+  
+  # Calculate AIC, AICc, and BIC
+  aic_values <- AIC(gamlr_obj)
+  aicc_values <- AICc(gamlr_obj)
+  bic_values <- BIC(gamlr_obj)
+  
+  # Extracting lambda values
+  lambda_aicc <- gamlr_obj$lambda[which.min(aicc_values)]
+  lambda_aic <- gamlr_obj$lambda[which.min(aic_values)]
+  lambda_bic <- gamlr_obj$lambda[which.min(bic_values)]
+  lambda_min <- cv_obj$lambda.min
+  lambda_1se <- cv_obj$lambda.1se
+  
+  return(list(lambda_aicc = lambda_aicc,
+              lambda_aic = lambda_aic,
+              lambda_bic = lambda_bic,
+              lambda_min = lambda_min,
+              lambda_1se = lambda_1se))
+}
+
+lambdas <- log_lambdas(lasso_sum.cv)
+
+# Log lambdas
+log(lambdas$lambda_aicc)
+log(lambdas$lambda_aic)
+log(lambdas$lambda_bic)
+log(lambdas$lambda_min)
+log(lambdas$lambda_1se)
+
+# Plot the LASSO path from gamlr
+plot(lasso_sum.cv$gamlr, main = "Summary LASSO Path with AIC, AICc, BIC, and CV")
+
+# Adding vertical lines for the different criteria
+abline(v = log(lambdas$lambda_aicc), col = "black", lty = 2)
+abline(v = log(lambdas$lambda_aic), col = "purple", lty = 2)
+abline(v = log(lambdas$lambda_bic), col = "green", lty = 2)
+abline(v = log(lambdas$lambda_min), col = "orange", lty = 2)
+abline(v = log(lambdas$lambda_1se), col = "blue", lty = 2)
+
+legend("topright", bty = "n", lwd = 1, 
+       col = c("black", "purple", "green", "orange", "blue"),
+       legend = c("AICc", "AIC", "BIC", "CV.min", "CV.1se"))
+
+# Plot the cross-validation plot
+plot(lasso_sum.cv, main = "Cross-Validation")
+```
+
+
+## OOS R2
+## OOS R2 LASSO
+
+```{r}
+library(glmnet)
+library(gamlr)
+library(ggplot2)
+set.seed(1234)
+
+## Combine x 
+genre_dummies <- model.matrix(~ genre - 1, data = game)
+year_cont <- model.matrix(~ year_adj, data = game)
+publisher_dummies <- model.matrix(~ publisher - 1, data = game)
+game$Rating <- as.numeric(game$Rating)
+rating_cont <- model.matrix(~ Rating, data = game)
+ip_dummies <- model.matrix(~ IP_Type - 1, data = game)
+x <- cbind(genre_dummies, year_cont, publisher_dummies, rating_cont, ip_dummies, tdm_sparse, console_sparse)
+x <- as(x, "sparseMatrix")
+
+# Function to split data and calculate OOS R² for LASSO
+calculate_oos_r2 <- function(x, y, train_fraction = 0.7, n_splits = 20) {
+  oos_r2_values <- numeric(n_splits)
+  
+  for (i in 1:n_splits) {
+    # Split data into training and testing sets
+    train_indices <- sample(1:nrow(x), size = floor(train_fraction * nrow(x)))
+    test_indices <- setdiff(1:nrow(x), train_indices)
+    
+    x_train <- x[train_indices, ]
+    y_train <- y[train_indices]
+    x_test <- x[test_indices, ]
+    y_test <- y[test_indices]
+    
+    # Fit LASSO model
+    lasso_model <- cv.gamlr(x_train, y_train, lambda.min.ratio = 1e-3, family = "gaussian")
+    
+    # Predict on test set using the lambda with minimum cross-validated error
+    y_pred <- predict(lasso_model, x_test, select = "min")
+    
+    # Calculate OOS R²
+    rss <- sum((y_test - y_pred)^2)
+    tss <- sum((y_test - mean(y_test))^2)
+    oos_r2 <- 1 - rss/tss
+    
+    oos_r2_values[i] <- oos_r2
+  }
+  
+  return(oos_r2_values)
+}
+
+# Apply function to your data
+x <- as.matrix(x)  # Ensure x is a matrix
+y <- game$log_activePlayers
+oos_r2_lasso <- calculate_oos_r2(x, y)
+
+# Repeat for other models and collect their OOS R² values
+# For brevity, only LASSO is shown here. Extend similarly for other models.
+
+
+# Combine OOS R² values into a data frame
+model_names <- rep(c("LASSO"), each = 20)  # Extend with other model names
+oos_r2_values <- c(oos_r2_lasso)  # Combine with other OOS R² values
+
+results_df <- data.frame(model = model_names, OOS_R2 = oos_r2_values)
+```
+
+
+## Unpruned tree
+```{r}
+library(rpart)
+library(rpart.plot)
+
+genre_df <- as.data.frame(model.matrix(~ genre - 1, data = game))
+publisher_df <- as.data.frame(model.matrix(~ publisher - 1, data = game))
+ip_df <- model.matrix(~ IP_Type - 1, data = game)
+tdm_df <- as.data.frame(as.matrix(tdm_sparse))
+x_tree <- cbind(game[, c("year_adj", "Rating")], genre_df, publisher_df, ip_df, console_df) # , tdm_df
+x_tree$year_adj <- scale(x_tree$year_adj)
+x_tree$Rating <- scale(x_tree$Rating)
+
+# Fit the unpruned decision tree model
+tree_model <- rpart(game$log_activePlayers ~ ., data = data.frame(x_tree), control = rpart.control(cp = 0))
+
+# Plot the unpruned tree
+rpart.plot(tree_model, main = "Unpruned Decision Tree")
+
+pdf("unpruned_tree_plot.pdf", width = 8, height = 6)
+rpart.plot(tree_model, main = "Unpruned Decision Tree")
+dev.off()
+
+
+# Function to split data and calculate OOS R² for the unpruned tree
+calculate_oos_r2_tree <- function(x, y, train_fraction = 0.7, n_splits = 20) {
+  oos_r2_values <- numeric(n_splits)
+  
+  for (i in 1:n_splits) {
+    # Split data into training and testing sets
+    train_indices <- sample(1:nrow(x), size = floor(train_fraction * nrow(x)))
+    test_indices <- setdiff(1:nrow(x), train_indices)
+    
+    x_train <- x[train_indices, ]
+    y_train <- y[train_indices]
+    x_test <- x[test_indices, ]
+    y_test <- y[test_indices]
+    
+    # Fit the unpruned decision tree model
+    tree_model <- rpart(y_train ~ ., data = data.frame(x_train), control = rpart.control(cp = 0))
+    
+    # Predict on the test set
+    y_pred <- predict(tree_model, newdata = data.frame(x_test))
+    
+    # Calculate OOS R²
+    rss <- sum((y_test - y_pred)^2)
+    tss <- sum((y_test - mean(y_test))^2)
+    oos_r2 <- 1 - rss/tss
+    
+    oos_r2_values[i] <- oos_r2
+  }
+  
+  return(oos_r2_values)
+}
+
+# Apply function to your data
+oos_r2_tree <- calculate_oos_r2_tree(x_tree, game$log_activePlayers)
+
+# Combine OOS R² values into a data frame
+# model_names <- rep(c("LASSO_AICc", "LASSO_CVmin", "Tree_Unpruned"), each = 20)
+# oos_r2_values <- c(oos_r2_results$oos_r2_aicc, oos_r2_results$oos_r2_cv_min, oos_r2_tree)
+# 
+# results_df <- data.frame(model = model_names, OOS_R2 = oos_r2_values)
+
+# # Plot using ggplot2
+# ggplot(results_df, aes(x = model, y = OOS_R2)) +
+#   geom_boxplot(fill = "purple", color = "black") +
+#   theme_minimal() +
+#   labs(title = "OOS R² Comparison for LASSO and Unpruned Tree", x = "Model", y = "OOS R²") +
+#   theme(plot.title = element_text(hjust = 0.5))
+```
+
+
+```{r}
+# Prune the tree based on the cp that minimizes cross-validated error
+cp_table <- printcp(tree_model)
+best_cp <- cp_table[which.min(cp_table[, "xerror"]), "CP"]
+pruned_tree <- prune(tree_model, cp = best_cp)
+
+# Plot the pruned tree
+rpart.plot(pruned_tree, main = "Pruned Decision Tree")
+
+pdf("pruned_tree_plot.pdf", width = 8, height = 6)
+rpart.plot(pruned_tree, main = "Pruned Decision Tree")
+dev.off()
+
+# Function to calculate OOS R² for a given tree model
+calculate_oos_r2_tree <- function(x, y, tree_control, train_fraction = 0.7, n_splits = 20) {
+  oos_r2_values <- numeric(n_splits)
+  
+  for (i in 1:n_splits) {
+    # Split data into training and testing sets
+    train_indices <- sample(1:nrow(x), size = floor(train_fraction * nrow(x)))
+    test_indices <- setdiff(1:nrow(x), train_indices)
+    
+    x_train <- x[train_indices, ]
+    y_train <- y[train_indices]
+    x_test <- x[test_indices, ]
+    y_test <- y[test_indices]
+    
+    # Fit the tree model
+    tree_model <- rpart(y_train ~ ., data = data.frame(x_train), control = tree_control)
+    
+    # Predict on the test set
+    y_pred <- predict(tree_model, newdata = data.frame(x_test))
+    
+    # Calculate OOS R²
+    rss <- sum((y_test - y_pred)^2)
+    tss <- sum((y_test - mean(y_test))^2)
+    oos_r2 <- 1 - rss/tss
+    
+    oos_r2_values[i] <- oos_r2
+  }
+  
+  return(oos_r2_values)
+}
+
+# Apply function to your data for unpruned tree
+unpruned_control <- rpart.control(cp = 0)
+oos_r2_unpruned <- calculate_oos_r2_tree(x_tree, game$log_activePlayers, unpruned_control)
+
+# Apply function to your data for pruned tree
+pruned_control <- rpart.control(cp = best_cp)
+oos_r2_pruned <- calculate_oos_r2_tree(x_tree, game$log_activePlayers, pruned_control)
+
+# Combine OOS R² values into a data frame
+model_names <- rep(c("Unpruned Tree", "Pruned Tree"), each = 20)
+oos_r2_values <- c(oos_r2_unpruned, oos_r2_pruned)
+
+results_df <- data.frame(model = model_names, OOS_R2 = oos_r2_values)
+
+# Plot using ggplot2
+ggplot(results_df, aes(x = model, y = OOS_R2)) +
+  geom_boxplot(fill = "purple", color = "black") +
+  theme_minimal() +
+  labs(title = "OOS R² Comparison for Unpruned and Pruned Trees", x = "Model", y = "OOS R²") +
+  theme(plot.title = element_text(hjust = 0.5))
+
+```
+
+## Random Forest
+```{r}
+# Convert factors to numeric
+x_tree <- cbind(game[, c("year_adj", "Rating")], genre_df, publisher_df, ip_df, console_df)
+x_tree$year_adj <- scale(x_tree$year_adj)
+x_tree$Rating <- scale(x_tree$Rating)
+x_tree <- data.frame(lapply(x_tree, function(x) if(is.factor(x)) as.numeric(x) else x))
+
+# Fit the Random Forest model
+rf_model <- randomForest(game$log_activePlayers ~ ., data = data.frame(x_tree), ntree = 500, importance = TRUE)
+print(rf_model)
+
+# Plot the importance of variables
+png("variable_importance_plot.png", width = 1200, height = 800)
+par(mar = c(5, 15, 4, 2) + 0.1)
+varImpPlot(rf_model, main = "Variable Importance Plot", n.var = min(30, nrow(rf_model$importance)))
+dev.off()
+
+
+# Function to split data and calculate OOS R² for Random Forest
+calculate_oos_r2_rf <- function(x, y, train_fraction = 0.7, n_splits = 20) {
+  oos_r2_values <- numeric(n_splits)
+  
+  for (i in 1:n_splits) {
+    # Split data into training and testing sets
+    train_indices <- sample(1:nrow(x), size = floor(train_fraction * nrow(x)))
+    test_indices <- setdiff(1:nrow(x), train_indices)
+    
+    x_train <- x[train_indices, ]
+    y_train <- y[train_indices]
+    x_test <- x[test_indices, ]
+    y_test <- y[test_indices]
+    
+    # Fit the Random Forest model
+    rf_model <- randomForest(y_train ~ ., data = data.frame(x_train), ntree = 500)
+    
+    # Predict on the test set
+    y_pred <- predict(rf_model, newdata = data.frame(x_test))
+    
+    # Calculate OOS R2
+    rss <- sum((y_test - y_pred)^2)
+    tss <- sum((y_test - mean(y_test))^2)
+    oos_r2 <- 1 - rss/tss
+    
+    oos_r2_values[i] <- oos_r2
+  }
+  
+  return(oos_r2_values)
+}
+
+
+x <- as.matrix(x_tree)
+y <- game$log_activePlayers
+oos_r2_rf <- calculate_oos_r2_rf(x, y)
+```
+
+```{r}
+# # Combine OOS R² values into a data frame
+# model_names <- rep(c("LASSO_AICc", "LASSO_CVmin", "Tree_Unpruned", "Tree_Pruned", "RF"), each = 20)
+# oos_r2_values <- c(oos_r2_results$oos_r2_aicc, oos_r2_results$oos_r2_cv_min, oos_r2_tree, oos_r2_pruned, oos_r2_rf)
+# 
+# results_df <- data.frame(model = model_names, OOS_R2 = oos_r2_values)
+# 
+# # Plot using ggplot2
+# ggplot(results_df, aes(x = model, y = OOS_R2)) +
+#   geom_boxplot(fill = "purple", color = "black") +
+#   theme_minimal() +
+#   labs(title = "OOS R² Comparison for LASSO, Trees, and Random Forest", x = "Model", y = "OOS R²") +
+#   theme(plot.title = element_text(hjust = 0.5))
+
+```
+
+
+## KNN
+
+
+```{r}
+set.seed(1234)
+# Selecting columns and creating model matrix
+publisher_dummies <- model.matrix(~ publisher - 1, data = game)
+developer_dummies <- model.matrix(~ developer - 1, data = game)
+genre_dummies <- model.matrix(~ genre - 1, data = game)
+developer_dummies <- model.matrix(~ developer - 1, data = game)
+ip_dummies <- model.matrix(~ IP_Type - 1, data = game)
+year_cont <- model.matrix(~ year_adj, data = game)
+rating_cont <- model.matrix(~ Rating, data = game)
+
+predictors_knn <- cbind(year_cont, genre_dummies, rating_cont, publisher_dummies, developer_dummies, ip_dummies, tdm_sparse, console_sparse)
+predictors_knn <- as(predictors_knn, "sparseMatrix")
+```
+
+
+```{r}
+set.seed(1234)
+quantiles <- quantile(game$activePlayers, probs=c(0, 0.5, 1), na.rm=TRUE)
+y <- cut(game$activePlayers, breaks=quantiles, include.lowest=TRUE, labels=c(0, 1))
+train <- createDataPartition(y, p = 0.5, list = FALSE)
+
+## Compare K = 10, 20, 40
+set.seed(1234)
+nearest10 <- class::knn(train=predictors_knn[train,], test=predictors_knn[-train,], cl=y[train], prob=TRUE, k=10)  
+nearest20 <- class::knn(train=predictors_knn[train,], test=predictors_knn[-train,], cl=y[train], prob=TRUE, k=20)  
+nearest40 <- class::knn(train=predictors_knn[train,], test=predictors_knn[-train,], cl=y[train], prob=TRUE, k=40)  
+data.frame(y[-train],nearest10,nearest20, nearest40)
+
+confusion_matrix_10 <- table(y[-train], nearest10)
+confusion_matrix_20 <- table(y[-train], nearest20)
+confusion_matrix_40 <- table(y[-train], nearest40)
+fp_rate_10 <- confusion_matrix_10[1,2] / sum(confusion_matrix_10[,2]) # False Positive Rate
+fn_rate_10 <- confusion_matrix_10[2,1] / sum(confusion_matrix_10[,1]) # False Negative Rate
+sensitivity_10 <- confusion_matrix_10[2,2] / sum(confusion_matrix_10[2,]) # Sensitivity
+specificity_10 <- confusion_matrix_10[1,1] / sum(confusion_matrix_10[1,]) # Specificity
+
+# Calculate performance metrics for k = 20
+fp_rate_20 <- confusion_matrix_20[1,2] / sum(confusion_matrix_20[,2]) # False Positive Rate
+fn_rate_20 <- confusion_matrix_20[2,1] / sum(confusion_matrix_20[,1]) # False Negative Rate
+sensitivity_20 <- confusion_matrix_20[2,2] / sum(confusion_matrix_20[2,]) # Sensitivity
+specificity_20 <- confusion_matrix_20[1,1] / sum(confusion_matrix_20[1,]) # Specificity
+
+# Calculate performance metrics for k = 40
+fp_rate_40 <- confusion_matrix_40[1,2] / sum(confusion_matrix_40[,2]) # False Positive Rate
+fn_rate_40 <- confusion_matrix_40[2,1] / sum(confusion_matrix_40[,1]) # False Negative Rate
+sensitivity_40 <- confusion_matrix_40[2,2] / sum(confusion_matrix_40[2,]) # Sensitivity
+specificity_40 <- confusion_matrix_40[1,1] / sum(confusion_matrix_40[1,]) # Specificity
+
+# Output the performance metrics
+results <- data.frame(
+  k = c(10, 20, 40),
+  fp_rate = c(fp_rate_10, fp_rate_20, fp_rate_40),
+  fn_rate = c(fn_rate_10, fn_rate_20, fn_rate_40),
+  sensitivity = c(sensitivity_10, sensitivity_20, sensitivity_40),
+  specificity = c(specificity_10, specificity_20, specificity_40)
+)
+
+print(results)
+
+predictors_knn <- as.data.frame(as.matrix(developer_dummies))
+
+## Plot the three KNN models
+par(mfrow = c(1, 3))
+# Plot for 10/20/40-nearest neighbors
+plot(game[train, 'Rating'], predictors_knn[train, 2], col = y[train], cex = 0.8, pch = 18, xlab = "Rating", ylab = "log_activePlayers", main = "10-nearest neighbors")
+points(game[-train, 'Rating'], predictors_knn[-train, 2], pch = 21, col = 1, cex = 1.25)
+points(game[-train, 'Rating'], predictors_knn[-train, 2], bg = nearest10, pch = 21, col = grey(0.9), cex = 1.25)
+
+plot(game[train, 'Rating'], predictors_knn[train, 2], col = y[train], cex = 0.8, pch = 18, xlab = "Rating", ylab = "log_activePlayers", main = "20-nearest neighbors")
+points(game[-train, 'Rating'], predictors_knn[-train, 2], pch = 21, col = 1, cex = 1.25)
+points(game[-train, 'Rating'], predictors_knn[-train, 2], bg = nearest20, pch = 21, col = grey(0.9), cex = 1.25)
+
+plot(game[train, 'Rating'], predictors_knn[train, 2], col = y[train], cex = 0.8, pch = 18, xlab = "Rating", ylab = "log_activePlayers", main = "40-nearest neighbors")
+points(game[-train, 'Rating'], predictors_knn[-train, 2], pch = 21, col = 1, cex = 1.25) 
+points(game[-train, 'Rating'], predictors_knn[-train, 2], bg = nearest40, pch = 21, col = grey(0.9), cex = 1.25)
+
+# Add legend
+legend("topright", legend = levels(y), fill = 1:2, bty = "n", cex = 0.75)
+
+```
+```{r}
+
+## Problematic
+# Plot the three KNN models
+par(mfrow = c(1, 3))
+
+# Define colors for plot
+colors <- c("black", "red")
+
+# Plot for 10-nearest neighbors
+plot(game$Rating[train], log(game$activePlayers[train]), col = colors[as.numeric(y[train])], cex = 0.8, pch = 18, xlab = "Rating", ylab = "log_activePlayers", main = "10-nearest neighbors")
+points(game$Rating[-train], log(game$activePlayers[-train]), pch = 21, col = colors[as.numeric(nearest10)], cex = 1.25)
+
+# Plot for 20-nearest neighbors
+plot(game$Rating[train], log(game$activePlayers[train]), col = colors[as.numeric(y[train])], cex = 0.8, pch = 18, xlab = "Rating", ylab = "log_activePlayers", main = "20-nearest neighbors")
+points(game$Rating[-train], log(game$activePlayers[-train]), pch = 21, col = colors[as.numeric(nearest20)], cex = 1.25)
+
+# Plot for 40-nearest neighbors
+plot(game$Rating[train], log(game$activePlayers[train]), col = colors[as.numeric(y[train])], cex = 0.8, pch = 18, xlab = "Rating", ylab = "log_activePlayers", main = "40-nearest neighbors")
+points(game$Rating[-train], log(game$activePlayers[-train]), pch = 21, col = colors[as.numeric(nearest40)], cex = 1.25)
+
+# Add legend
+legend("topright", legend = c("0", "1"), fill = colors, bty = "n", cex = 0.75)
+```
+
+
+```{r}
+set.seed(1234)
+nearest <- class::knn(train=predictors_knn[train,], test=predictors_knn[-train,], cl=y[train], prob=TRUE, k=floor(40))  # sqrt(1735)
+attr<-attributes(nearest)
+t1 <- table(y[-train], nearest)
+t1
+
+# Calculate relevant rates
+t1[1,2]/sum(t1[,2]) # FALSE POSITIVE RATE:   
+t1[2,1]/sum(t1[,1]) # FALSE NEGATIVE RATE: 
+t1[2,2]/sum(t1[2,]) # SENSITIVITY: 
+t1[1,1]/sum(t1[1,]) # SPECIFICITY: 
+
+source("roc.R")
+roc(p= attr$prob, y=y[-train], bty="n")
+title("ROC Curve after KNN Analysis, K=40")
+```
+```{r}
+## 
+probabilities <- attr$prob
+
+# Combine the test set indices with their probabilities
+test_indices <- (1:nrow(game))[-train]
+prob_data <- data.frame(index = test_indices, probability = probabilities, nearest = nearest)
+
+# Sort by probability to get top 5 games
+top_5k <- prob_data %>%
+  arrange(desc(probability)) %>%
+  head(26)
+
+top_5k
+
+# Get the details of the top 5 games
+top_5k_games <- game[top_5k$index, ]
+top_5k_games <- top_5k_games[top_5k_games$activePlayers_dummy == 1, ]
+
+print(top_5k_games)
+
+# Function to get top three most common values
+get_top_three <- function(x) {
+  as.data.frame(sort(table(x), decreasing = TRUE)[1:10])}
+
+# Analyze the characteristics of the top 5 games
+characteristics <- top_5k_games %>%
+  summarise(
+    average_rating = mean(Rating),
+    average_year = mean(year_adj)
+  )
+
+# Get top three genres, publishers, developers, and consoles
+top_three_genres <- get_top_three(top_5k_games$genre)
+top_three_publishers <- get_top_three(top_5k_games$publisher)
+top_three_developers <- get_top_three(top_5k_games$developer)
+top_three_consoles <- get_top_three(top_5k_games$console)
+
+# Print results
+print(characteristics)
+print("Top Three Genres:")
+print(top_three_genres)
+print("Top Three Publishers:")
+print(top_three_publishers)
+print("Top Three Developers:")
+print(top_three_developers)
+print("Top Three Consoles:")
+print(top_three_consoles)
+
+```
+
+## Multinomial Logistic Regression
+
+```{r}
+# Ensure response is a factor if it's multinomial
+# Split data for cross-validation
+set.seed(123)
+predictors_knn <- cbind(year_cont, genre_dummies, rating_cont, publisher_dummies, developer_dummies, ip_dummies, tdm_sparse, console_sparse)
+predictors_knn <- as(predictors_knn, "sparseMatrix")
+quantiles <- quantile(game$activePlayers, probs=c(0, 0.5, 1), na.rm=TRUE)
+y <- cut(game$activePlayers, breaks=quantiles, include.lowest=TRUE, labels=c(0, 1))
+train_indices <- createDataPartition(y, p = 0.5, list = TRUE)
+train_data <- predictors_knn[train_indices[[1]], ]
+train_response <- y[train_indices[[1]]]
+test_data <- predictors_knn[-train_indices[[1]], ]
+test_response <- y[-train_indices[[1]]]
+```
+
+
+```{r}
+set.seed(1234)
+
+# Fit the glmnet model
+cv_fit <- cv.glmnet(train_data, train_response, family = "multinomial")
+plot(cv_fit, main="Cross-Validation")
+par(mfrow=c(1,2))
+plot(cv_fit$glmnet)
+
+best_coefs <- coef(cv_fit, s = "lambda.min")
+coefs_matrix <- as.matrix(best_coefs)
+print(coefs_matrix)
+
+# Predict and evaluate model
+predictions <- predict(cv_fit, newx = test_data, s = "lambda.min", type = "response")
+predicted_classes <- apply(predictions, 1, which.max)
+accuracy <- mean(predicted_classes == test_response)
+print(paste("Accuracy: ", accuracy))
+
+# Plotting class probabilities
+prob_matrix <- predict(cv_fit, newx = test_data, type = "response", s = "lambda.min")
+boxplot(prob_matrix ~ test_response, col = "orange", varwidth = TRUE, main="Fit Plot of Test Response")
+
+```
+
+
+
+
+
+## Does higher rating causes more number of players?
+```{r}
+library(gamlr)
+library(Matrix)
+library(dplyr)
+
+set.seed(1234)
+
+# Selecting columns and creating model matrix
+game_console <- cbind(game[, c("year_adj", "Number.of.Reviews", "publisher", "genre")], console_df)
+game_console$year_adj <- scale(game_console$year_adj)
+game_console$Number_of_Reviews <- scale(game_console$Number.of.Reviews)
+game$genre <- as.factor(game$genre)
+game$publisher <- as.factor(game$publisher)
+game$Rating <- as.numeric(game$Rating)
+
+# Convert to a model matrix for Lasso
+x <- model.matrix(~ ., data = game_console)
+d <- game$Rating # Treatment
+y <- game$log_activePlayers  # Outcome
+
+
+## NAIVE LASSO regression
+# Naive LASSO adds "treatment" as an extra covariate without giving it any special attention
+naive <- gamlr(cbind(d,x),y)
+coef(naive)["d",] # effect is AICc selected <0
+plot(naive, main = "LASSO plot, Naive LASSO")
+coef(naive, select=which.min(AICc(naive)))
+# this is the effect of treatment, given everything else that LASSO keeps in the model the "everything else", however, might not include all the confounders :(
+
+
+## Two stage LASSO
+# First stage Lasso to predict treatment
+treat <- gamlr(x, d, lambda.min.ratio=1e-4)
+plot(treat, main = "LASSO plot, First Stage LASSO")  # Visualize the variable selection
+
+# Predict the treatment (d_hat)
+dhat <- predict(treat, x, type="response")
+cor(drop(dhat),d)^2
+plot(dhat,d,bty="n",pch=21,bg=8, main = "Relationship between d and d_hat") 
+
+# Second stage Lasso to predict the outcome
+causal <- gamlr(cbind(d, dhat, x), y, free=2, lmr=1e-4)
+coef(causal)["d",]  # Extract the coefficient for the treatment
+
+n <- nrow(x)
+gamma <- c()  # Initialize storage for bootstrap results
+
+for(b in 1:100){
+    ib <- sample(1:n, n, replace=TRUE)
+    xb <- x[ib, ]
+    db <- d[ib]
+    yb <- y[ib]
+    treatb <- gamlr(xb, db, lambda.min.ratio=1e-3)
+    dhatb <- predict(treatb, xb, type="response")
+    fitb <- gamlr(cbind(db, dhatb, xb), yb, free=2)
+    gamma <- c(gamma, coef(fitb)["db", ])
+}
+
+summary(gamma)  # Summarize the bootstrap results
+
+mle <- glm(y ~ cbind(d, x)) 
+
+# # get a standard error from Bootstrap
+#
+mean(gamma)+2*sd(gamma)
+mean(gamma)-2*sd(gamma)
+se <- summary(mle)$coef[2, 2]
+se
+
+sd(gamma)
+
+# Plot Boostrap
+hist(gamma, freq = FALSE, main = "Bootstrapping Result, Causal Effect of Rating (gamma)", xlim = c(0, 0.1))
+
+# Calculate the standard error and coefficient from your model mle
+
+coef_estimate <- coef(mle)["cbind(d, x)d"]
+
+# Add vertical lines
+abline(v = coef_estimate, col = "orange", lwd = 2)  # Original estimate
+text(coef_estimate, 0, labels = "mle Est.", pos = 3, cex = 0.8, col = "orange")
+abline(v = mean(gamma), col = "purple", lwd = 2)  # gamma mean
+text(mean(gamma), 0, labels = "Boostrap Est.", pos = 3, cex = 0.8, col = "purple")
+
+# Confidence interval from mle
+abline(v = coef_estimate + 2 * se, col = "orange", lwd = 2, lty = "dashed")  # Upper mle CI
+text(coef_estimate + 2 * se, 0, labels = "mle CI", pos = 3, cex = 0.8, col = "orange")
+abline(v = coef_estimate - 2 * se, col = "orange", lwd = 2, lty = "dashed")  # Lower mle CI
+text(coef_estimate - 2 * se, 0, labels = "mle CI", pos = 3, cex = 0.8, col = "orange")
+
+# Confidence interval from bootstrap
+abline(v = quantile(gamma, 0.025), col = "purple", lwd = 2, lty = "dashed")
+text(quantile(gamma, 0.025), 0, labels = "Bootstrap CI", pos = 3, cex = 0.8, col = "purple")
+abline(v = quantile(gamma, 0.975), col = "purple", lwd = 2, lty = "dashed")
+text(quantile(gamma, 0.975), 0, labels = "Bootstrap CI", pos = 3, cex = 0.8, col = "purple")
+
+
+```

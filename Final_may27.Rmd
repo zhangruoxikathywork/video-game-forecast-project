@@ -1,0 +1,148 @@
+---
+title: "Final"
+author: "Regina"
+date: "2024-05-26"
+output: html_document
+---
+
+```{r}
+games <- read.csv('game2.csv')
+```
+
+# Section 3.B.b).(5), Figure 23, P15
+Network: Explore the connection between developers
+
+```{r}
+library(igraph)
+```
+
+```{r}
+edges <- data.frame(
+  Source = games$developer,
+  Target = games$publisher
+)
+```
+
+```{r}
+edges <- na.omit(edges)
+# Remove rows where either Source or Target is "Unknown"
+edges <- edges[edges$Source != "Unknown" & edges$Target != "Unknown", ]
+
+# Remove self-loops (where Source is equal to Target)
+edges <- edges[edges$Source != edges$Target, ]
+
+# Create the graph
+edges <- as.matrix(edges)
+```
+
+```{r}
+# Create the graph
+dev <- graph.edgelist(edges, directed=FALSE)
+
+# Create a vector for labels, defaulting to no labels
+vertex_labels <- rep("", vcount(dev))
+vertex_colors <- rep(rgb(173, 216, 230, alpha=100, maxColorValue=255), vcount(dev))  # lightblue with alpha
+
+# Identify the 10 vertices with the highest degrees
+top_10_vertices <- order(degree(dev), decreasing = TRUE)[1:10]
+vertex_colors[top_10_vertices] <- rgb(255, 165, 0, alpha=100, maxColorValue=255)  # orange with alpha
+
+# Set labels for these top 15 vertices
+vertex_labels[top_10_vertices] <- V(dev)[top_10_vertices]$name
+
+vertex_sizes <- ifelse(degree(dev) > 6, 6, 3)
+
+# Plot the graph
+plot(dev, layout = layout_nicely(dev),
+     vertex.color = vertex_colors,
+     vertex.size = vertex_sizes,
+     vertex.label = vertex_labels,  # Apply the conditional labels
+     vertex.label.color = "black",
+     vertex.label.cex = 1.2,        # Increase label size
+     vertex.label.family = "sans",  # Use a sans-serif font
+     vertex.label.font = 2,
+     vertex.label.dist = 0.5)
+```
+
+```{r}
+vertex_labels[top_10_vertices] 
+```
+
+```{r}
+# Calculate betweenness centrality
+betweenness_scores <- betweenness(dev)
+
+# Identify the top 10 vertices with the highest betweenness
+top_10_betweenness <- sort(betweenness_scores, decreasing = TRUE)[1:10]
+top_10_labels <- names(top_10_betweenness)
+
+barplot_heights <- barplot(top_10_betweenness, 
+                           main = "Top 10 Nodes by Betweenness Centrality",
+                           ylab = "Betweenness Centrality",
+                           col = "orange",  # Bar color
+                           cex.main = 1.2,   # Font size of the title
+                           cex.lab = 1,      # Font size of the labels
+                           las = 2,          # Rotate x-axis labels to be perpendicular to the axis
+                           names.arg = rep("", length(top_10_labels)))  # Suppress x-axis labels
+
+# Add tilted x-axis labels manually
+text(barplot_heights, par("usr")[3] - 0.02, 
+     labels = top_10_labels, 
+     srt = 20,           # String rotation angle
+     adj = c(1, 1),      # Adjusts the text position
+     xpd = TRUE,         # Allows drawing outside the plot area
+     cex = 0.8)    
+```
+
+
+# Section 3.B.b).(3), Model, P14
+```{r}
+library(quanteda)
+
+filler_words <- c("the", "is", "a", "has", "have", "and", "of", "in", "to", "for", "with", "on", "that", "lets","as", "out", "by","from", "this", "be", "an", "v", "or", "so", "you", "are", "can", "will", "which", "t", "who", "where", "also", "his", "her", "their", "they", "up", "he", "she", "its", "it", "includes", "include","your", "you", "all","���������", "s", "any", "ll", "was", "but", "if", "there", "these")
+
+# Function to clean and tokenize text, removing filler words
+clean_and_tokenize <- function(text, filler_words) {
+  text_clean <- tolower(enc2utf8(text))
+  # text_clean <- tolower(gsub("[^\\x01-\\x7F]", "", text_clean))
+  text_clean <- str_replace_all(text_clean, "[[:punct:]]", " ")
+  words <- unlist(strsplit(text_clean, "\\s+"))
+  words <- words[!words %in% filler_words]
+  return(words)
+}
+
+# Apply the function to the Summary column
+game$Review_clean <- sapply(game$Reviews, function(x) paste(clean_and_tokenize(x, filler_words), collapse = " "))
+
+corp <- corpus(game$Summary_clean)
+
+specific_stopwords <- c(stopwords("english"), stopwords("portuguese"), stopwords("french"), "game", "games", "feel", "felt", "jogo", "feels","like", "n", "can", "t", "juego","good", "even","very","much","really")
+
+
+dfmat <- tokens(corp, what = "word", remove_numbers = TRUE, remove_punct = TRUE, remove_symbols = TRUE) %>% 
+    tokens_remove("\\p{P}", valuetype = "regex") %>%
+    tokens_remove(pattern = "[█⣿─⠀]", valuetype = "regex") %>%
+    tokens_remove(specific_stopwords, padding = TRUE) %>%
+    tokens_ngrams(n = 2) %>%
+    dfm()
+
+```
+
+```{r}
+dim(dfmat)
+```
+
+```{r}
+topfeatures(dfmat, n = 20) 
+```
+
+```{r}
+library(slam)
+library(maptpx)
+x <- as.simple_triplet_matrix(dfmat)
+tpcs <- topics(x,K=5*(1:5), verb=10)
+```
+
+```{r}
+summary(tpcs, n=10) 
+```

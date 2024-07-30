@@ -1,0 +1,158 @@
+---
+title: "Matrix_Processing"
+author: 'G12: Yufei Liu, Kathy Zhang, Liujun Hua'
+date: "2024-05-26"
+output: word_document
+---
+```{r}
+# Data Cleaning
+game <- read.csv("game.csv", fill = TRUE)
+game$year_adj <- game$year - 2000
+game$log_activePlayers <- log(game$activePlayers+1)
+game$log_allPlayers <- log(game$allPlayers+1)
+game <- game %>% mutate(activePlayers_dummy = ifelse(allPlayers > median(game$activePlayers), 1, 0)) # 
+game <- game %>% mutate(allPlayers_dummy = ifelse(allPlayers > median(game$allPlayers), 1, 0))
+game <- game %>% mutate(Rating_dummy = ifelse(Rating > 4, 1, 0))  # High rating
+summary(game)
+```
+
+
+```{r}
+## Clean Summary words
+# Define filler words to be removed
+filler_words <- c("the", "is", "a", "has", "have", "and", "of", "in", "to", "for", "with", "on", "that", "lets","as", "out", "by","from", "this", "be", "an", "most", "each", "one", "player","take","game","gameplay", "them", "at", "how", "may", "from","players","v", "or", "so", "you","what","while","other","into","through", "are", "can", "will", "which", "t", "who", "where", "also", "his", "her", "their", "they", "up", "he", "she", "its", "it", "includes", "include","your", "you", "all","���������", "s", "any", "ll", "was", "but", "if", "there", "these")
+
+# Function to clean and tokenize text, removing filler words
+clean_and_tokenize <- function(text, filler_words) {
+  text_clean <- tolower(enc2utf8(text))
+  # text_clean <- tolower(gsub("[^\\x01-\\x7F]", "", text_clean))
+  text_clean <- str_replace_all(text_clean, "[[:punct:]]", " ")
+  words <- unlist(strsplit(text_clean, "\\s+"))
+  words <- words[!words %in% filler_words]
+  return(words)
+}
+
+# Apply the function to the Summary column
+game$Summary_clean <- sapply(game$Summary, function(x) paste(clean_and_tokenize(x, filler_words), collapse = " "))
+
+# Create a corpus from the cleaned summaries
+corpus <- Corpus(VectorSource(game$Summary_clean))
+tdm <- TermDocumentMatrix(corpus, control = list(wordLengths = c(1, Inf)))
+tdm_matrix <- as.matrix(tdm)
+
+
+# Get word frequencies
+word_freq <- sort(rowSums(tdm_matrix), decreasing = TRUE)
+word_freq_df <- data.frame(word = names(word_freq), frequency = word_freq)
+
+# Filter for significant words
+sig_word_sum <- word_freq_df %>% filter(frequency > 5)
+sig_word_sum <- sig_word_sum %>% arrange(word) %>% slice(-1:-19)
+sig_word_sum <- as.character(sig_word_sum$word)
+
+# Convert to sparse matrix
+tdm_filtered <- tdm_matrix[sig_word_sum, ]
+tdm_sparse <- as(t(tdm_filtered), "sparseMatrix")
+
+
+# Filter the term-document matrix to keep only significant words
+tdm_filtered <- tdm_matrix[sig_word_sum, ]
+tdm_sparse <- as(t(tdm_filtered), "sparseMatrix")
+
+```
+
+```{r}
+## Yufei's IP
+game$series <- sapply(str_split(game$Title, "\\s+"), function(words) {
+  paste(words[1:min(length(words), 2)], collapse = " ")
+})
+
+# 计算每个系列的出现次数
+series_counts <- game %>%
+  group_by(series, publisher) %>%
+  summarise(Count = n(), .groups = 'drop')
+
+# 将 series_counts 加入到原数据框中
+game <- game %>%
+  left_join(series_counts, by = c("series", "publisher"))
+
+# 标记大IP和小IP
+game <- game %>%
+  mutate(IP_Type = case_when(
+    Count >= 6 ~ "Big IP",
+    Count >= 4 ~ "Medium IP",
+    Count >= 2 ~ "Small IP",
+    TRUE ~ "Not IP"
+  ))
+
+game <- game %>%
+  mutate(activePlayersGroup = cut(activePlayers, breaks = c(-Inf, 120000, 170000, Inf), labels = c("Low", "Medium", "High")))
+
+ip_data <- game %>%
+  filter(IP_Type %in% c("Big IP", "Small IP","Medium IP"))
+
+ip_data$activePlayers <- as.numeric(ip_data$activePlayers)
+table(ip_data$IP_Type)
+
+ip_data$activePlayers <- as.numeric(ip_data$activePlayers)
+
+summary(ip_data$activePlayers)
+
+ip_avg_active_players <- ip_data %>%
+  group_by(IP_Type) %>%
+  summarise(
+    avg_activePlayers = mean(activePlayers, na.rm = TRUE),
+    max_activePlayers = max(activePlayers, na.rm = TRUE),
+    min_activePlayers = min(activePlayers, na.rm = TRUE),
+    count = n()
+  )
+
+library(glmnet)
+library(caret)
+game <- game %>%
+  filter(!is.na(Rating) & !is.na(genre) & !is.na(IP_Type))
+game$IP_Type <- factor(game$IP_Type, levels = c("Big IP", "Medium IP", "Small IP", "Not IP"))
+```
+
+
+
+
+```{r}
+## Processing Console
+
+# Split the console column by spaces (or your actual delimiter)
+consoles_list <- strsplit(game$console, split = " ")
+
+# Flatten the list into a single vector and get unique console types
+unique_consoles <- unique(unlist(consoles_list))
+
+# Create a matrix where each row corresponds to a game and each column to a console, filled initially with 0s
+console_matrix <- matrix(0, nrow = nrow(game), ncol = length(unique_consoles), dimnames = list(NULL, unique_consoles))
+for (i in seq_along(consoles_list)) {
+  console_matrix[i, consoles_list[[i]]] <- 1
+}
+console_sparse <- Matrix(console_matrix, sparse = TRUE)
+console_df <- as.data.frame(as.matrix(console_sparse))
+colnames(console_df) <- unique_consoles
+```
+
+
+```{r}
+set.seed(1234)
+
+## Combine x 
+genre_dummies <- model.matrix(~ genre - 1, data = game)
+year_cont <- model.matrix(~ year_adj, data = game)
+publisher_dummies <- model.matrix(~ publisher - 1, data = game)
+game$Rating <- as.numeric(game$Rating)
+rating_cont <- model.matrix(~ Rating, data = game)
+ip_dummies <- model.matrix(~ IP_Type - 1, data = game)
+x <- cbind(genre_dummies, year_cont, publisher_dummies, rating_cont, ip_dummies, tdm_sparse, console_sparse)
+x <- as(x, "sparseMatrix")
+
+# x <- cbind(game[, c("year_adj", "publisher", "genre", "IP_Type", "Rating")], console_df)
+# x <- as(x, "sparseMatrix")  # or do not make sparse matrix
+y <- game$log_activePlayers
+```
+
+
